@@ -5,7 +5,7 @@
 
 .word {
     font-family: CustomFont, 'Impact', sans-serif;
-    font-size: 26px;
+    font-size: 27px;
     color: white;
     font-weight: 900;
     padding: 4px 6px;
@@ -14,8 +14,8 @@
          1px -1px 0 #000000,
         -1px  1px 0 #000000,
          1px  1px 0 #000000,
-         2px  2px 0 #FF00FF,
-        -2px -2px 0 #00FFFF;
+         2px  2px 0 #f50525,
+        -2px -2px 0 #f5e506;
 }
 
 .word-not-narrated-yet {

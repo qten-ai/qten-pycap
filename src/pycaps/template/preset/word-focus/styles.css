@@ -5,7 +5,7 @@
 
 .word {
     font-family: CustomFont, sans-serif;
-    font-size: 24px;
+    font-size: 27px;
     color: white;
     padding: 4px 4px;
     text-shadow: 
@@ -17,6 +17,6 @@
 }
 
 .word-being-narrated {
-    background-color: #f76f00;
+    background-color: #0a2ef8;
     border-radius: 5%;
 }
