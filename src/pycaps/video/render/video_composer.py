@@ -126,9 +126,11 @@ class VideoComposer:
 
         process = subprocess.Popen(
             ffmpeg_cmd,
-            stdin=subprocess.PIPE
+            stdin=subprocess.PIPE,
+            stderr=subprocess.PIPE,
         )
 
+        broken_pipe = False
         num_frames_to_render = end_frame - start_frame
         with tqdm(total=num_frames_to_render, desc="Rendering video frames") as pbar:
             frame_idx = start_frame
@@ -147,14 +149,23 @@ class VideoComposer:
                     process.stdin.write(frame.astype(np.uint8).tobytes())
                 except BrokenPipeError:
                     logger().error("FFmpeg process died early.")
+                    broken_pipe = True
                     break
 
                 frame_idx += 1
                 pbar.update(1)
 
         cap.release()
-        process.stdin.close()
-        process.wait()
+        # communicate() (not a manual stdin.close() + wait()) now that stderr is piped:
+        # communicate() closes stdin itself (handling an already-broken pipe internally) and
+        # avoids a deadlock from ffmpeg filling the OS stderr pipe buffer before exiting.
+        _, stderr = process.communicate()
+        if broken_pipe or process.returncode != 0:
+            stderr_text = stderr.decode("utf-8", errors="replace").strip() if stderr else ""
+            raise RuntimeError(
+                f"FFmpeg failed while rendering frames {start_frame}-{end_frame} "
+                f"(exit code {process.returncode}): {stderr_text or 'no stderr output'}"
+            )
 
     def _merge_parts(self, part_paths: List[str], merged_path: str) -> None:
         # Create a concat file
@@ -235,7 +246,11 @@ class VideoComposer:
 
             subprocess.run(ffmpeg_cmd, check=True, capture_output=True, text=True)
         except subprocess.CalledProcessError as e:
-            logger.error(f"Fatal error processing audio with ffmpeg: {e.stderr}")
+            # NB: was `logger.error(...)` — logger is the setup function (pycaps.logger.logger),
+            # not a logger instance, so this raised AttributeError instead of logging, masking
+            # the real ffmpeg failure below with an unrelated crash.
+            logger().error(f"Fatal error processing audio with ffmpeg: {e.stderr}")
+            raise RuntimeError(f"Failed to mux audio into video: {e.stderr}") from e
         finally:
             if os.path.exists(temp_audio_path):
                 os.remove(temp_audio_path)
@@ -243,36 +258,40 @@ class VideoComposer:
     def render(self, use_multiprocessing: bool = True, processes: Optional[int] = None, video_quality: VideoQuality = VideoQuality.MIDDLE) -> None:
         temp_dir = tempfile.mkdtemp()
 
-        if use_multiprocessing:
-            processes = processes or mp.cpu_count()
-            total_frames = self._output_to_frame - self._output_from_frame
-            chunk_size = math.ceil(total_frames / processes)
-            part_paths = []
-            jobs = []
-            for i in range(processes):
-                start = self._output_from_frame + i * chunk_size
-                end = min(self._output_from_frame + ((i+1) * chunk_size), self._output_to_frame)
-                part_path = os.path.join(temp_dir, f"part_{i}.mp4")
-                part_paths.append(part_path)
-                p = mp.Process(
-                    target=self._render_range, 
-                    args=(start, end, part_path, video_quality)
-                )
-                jobs.append(p)
-                p.start()
-            for p in jobs:
-                p.join()
-            merged_parts = os.path.join(temp_dir, "merged_parts.mp4")
-            self._merge_parts(part_paths, merged_parts)
-            final = self._output
-            self._mux_audio(merged_parts, final)
-        else:
-            # Single-process
-            tmp = os.path.join(temp_dir, "partial.mp4")
-            self._render_range(self._output_from_frame, self._output_to_frame, tmp, video_quality)
-            self._mux_audio(tmp, self._output)
-        
-        shutil.rmtree(temp_dir)
+        # try/finally: previously the temp_dir cleanup only ran on success, so any exception
+        # from the rendering/muxing steps below (including the ones this fix now raises instead
+        # of silently swallowing) leaked the directory under the OS temp dir on every failure.
+        try:
+            if use_multiprocessing:
+                processes = processes or mp.cpu_count()
+                total_frames = self._output_to_frame - self._output_from_frame
+                chunk_size = math.ceil(total_frames / processes)
+                part_paths = []
+                jobs = []
+                for i in range(processes):
+                    start = self._output_from_frame + i * chunk_size
+                    end = min(self._output_from_frame + ((i+1) * chunk_size), self._output_to_frame)
+                    part_path = os.path.join(temp_dir, f"part_{i}.mp4")
+                    part_paths.append(part_path)
+                    p = mp.Process(
+                        target=self._render_range,
+                        args=(start, end, part_path, video_quality)
+                    )
+                    jobs.append(p)
+                    p.start()
+                for p in jobs:
+                    p.join()
+                merged_parts = os.path.join(temp_dir, "merged_parts.mp4")
+                self._merge_parts(part_paths, merged_parts)
+                final = self._output
+                self._mux_audio(merged_parts, final)
+            else:
+                # Single-process
+                tmp = os.path.join(temp_dir, "partial.mp4")
+                self._render_range(self._output_from_frame, self._output_to_frame, tmp, video_quality)
+                self._mux_audio(tmp, self._output)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 def get_ffmpeg_libx264_preset_for_quality(quality: 'VideoQuality') -> str:
